@@ -1,0 +1,59 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: kafka-architecture-demo
+  kafka:
+    bootstrap-servers: localhost:9092
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+app:
+  kafka:
+    topics:
+      orders: orders
+      audit: orders-audit
+      dlq: orders-dlq
+      orders-partitions: 6
+      audit-partitions: 3
+      dlq-partitions: 3
+      replication-factor: 1
+    producer:
+      # Unique per application instance in a real deployment
+      transaction-id-prefix: order-tx-
+      send-timeout-seconds: 15
+    partitioner:
+      vip-customers: VIP-001,VIP-002,VIP-003
+      vip-partition: 0
+    consumer:
+      group-id: order-processing-group
+      dlq-group-id: orders-dlq-monitor-group
+      concurrency: 3
+    retry:
+      max-retries: 3
+      initial-interval-ms: 1000
+      multiplier: 2.0
+      max-interval-ms: 10000
+  log-engine:
+    base-dir: ${java.io.tmpdir}/kafka-log-engine
+    topic: orders
+    partition: 0
+    segment-bytes: 1024
+    index-interval-bytes: 256
+    max-follower-lag: 5
+    mirror-consumed-orders: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  level:
+    root: INFO
+    org.apache.kafka: WARN
+    org.springframework.kafka: INFO
+    com.example.kafka: DEBUG

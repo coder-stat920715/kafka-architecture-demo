@@ -1,0 +1,2177 @@
+{
+  "info": {
+    "name": "Kafka Architecture Demo",
+    "description": "# Kafka Architecture Demo - Postman collection\n\nEnd-to-end test suite for the Spring Boot / Kafka application. Every request has a description with\n**purpose, steps and expected result**, plus automated tests (Tests tab).\n\n## Setup\n1. Import this file into Postman. Variables live on the collection (Variables tab): `baseUrl` = http://localhost:8080,\n   `baseUrl2` = http://localhost:8082 (only for the rebalance test).\n2. Start infrastructure: `docker compose up -d` (Kafka KRaft + Kafka UI at http://localhost:8081).\n3. Start the app: `mvn spring-boot:run`.\n4. Open the Postman Console (View -> Show Postman Console) to see logs and the partition histogram.\n\n## Run order\nRun the folders **in order** with *Run collection* (Runner), iterations = 1, except:\n- **1.7** is meant to be run separately with 30 iterations (skip it in the full run by unchecking it, or keep it with 1 iteration).\n- **Folder 04** needs a second app instance started manually (see its description); uncheck it for an unattended run.\n- **Folder 05** must run in sequence and without other order traffic (the consumer mirrors orders into the simulator).\n\n| Folder | Verifies |\n|---|---|\n| 00 | Environment healthy; baselines captured |\n| 01 | Idempotent producer, VIP partitioner, key affinity, validation |\n| 02 | Transactional commit and abort (multi-topic atomicity) |\n| 03 | Manual ack, exponential backoff retry, DLQ, counters |\n| 04 | Rebalance listener, cooperative-sticky redistribution |\n| 05 | Log segments, sparse index, LEO vs HW, ISR behaviour |\n\n## Useful external checks\n- Kafka UI: http://localhost:8081 -> Topics -> `orders`, `orders-audit`, `orders-dlq`; Consumers -> `order-processing-group`.\n- `docker exec -it kafka-kraft /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group order-processing-group`\n- Application log keywords: `[CONSUME]`, `[RETRY]`, `[DLQ]`, `[DLQ-MONITOR]`, `[REBALANCE]`.\n\n## Troubleshooting\n- 503 from cluster-status / publish: broker not reachable - check `docker ps` and `spring.kafka.bootstrap-servers`.\n- Exact-count assertion in 3.5 fails: other traffic or an app restart occurred; re-run from 0.2.\n- Log-engine numbers off: an order was consumed (mirrored) after the reset; run 5.1 again and avoid publishing.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "baseUrl2",
+      "value": "http://localhost:8082"
+    },
+    {
+      "key": "vipPartition",
+      "value": "0"
+    },
+    {
+      "key": "settleDelayMs",
+      "value": "15000"
+    },
+    {
+      "key": "expectedProcessed",
+      "value": "0"
+    },
+    {
+      "key": "expectedDead",
+      "value": "0"
+    },
+    {
+      "key": "baselineProcessed",
+      "value": "0"
+    },
+    {
+      "key": "baselineDead",
+      "value": "0"
+    },
+    {
+      "key": "custA_partition",
+      "value": ""
+    },
+    {
+      "key": "partitionHistogram",
+      "value": "{}"
+    }
+  ],
+  "item": [
+    {
+      "name": "00 - Prerequisites & Baseline",
+      "description": "**Goal:** prove the environment is healthy and capture baseline counters used by later assertions.\n\n**Before you start**\n1. `docker compose up -d` and wait until `docker ps` shows `kafka-kraft` as *healthy*.\n2. `mvn spring-boot:run` (app on port 8080). Wait for the log line `Started KafkaArchitectureApplication`\n   and the three `[REBALANCE] ... ASSIGNED` lines (one per listener thread).\n3. Kafka UI is on http://localhost:8081 (cluster `local-kraft`) - keep it open for visual checks.\n4. Run this folder FIRST: request 2 resets the `expectedProcessed` / `expectedDead` counters.",
+      "item": [
+        {
+          "name": "0.1 Actuator health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"status is UP\", () => pm.expect(pm.response.json().status).to.eql(\"UP\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
+            },
+            "description": "**Purpose:** confirm the Spring Boot app is up.\n\n**Steps:** send the request.\n\n**Expected:** HTTP 200, `{\"status\":\"UP\"}`."
+          }
+        },
+        {
+          "name": "0.2 Cluster status (BASELINE)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"one KRaft broker\", () => pm.expect(b.cluster.brokers.length).to.eql(1));",
+                  "pm.test(\"orders has 6 partitions\", () => pm.expect(b.topics[\"orders\"].partitionCount).to.eql(6));",
+                  "pm.test(\"orders-audit has 3 partitions\", () => pm.expect(b.topics[\"orders-audit\"].partitionCount).to.eql(3));",
+                  "pm.test(\"orders-dlq has 3 partitions\", () => pm.expect(b.topics[\"orders-dlq\"].partitionCount).to.eql(3));",
+                  "pm.test(\"every orders partition has a leader and ISR\", () => {",
+                  "  b.topics[\"orders\"].partitions.forEach(p => { pm.expect(p.leader).to.not.be.null; pm.expect(p.isr.length).to.be.above(0); });",
+                  "});",
+                  "const g = b.consumerGroups[\"order-processing-group\"];",
+                  "pm.test(\"consumer group is Stable\", () => pm.expect(g.state).to.eql(\"Stable\"));",
+                  "pm.test(\"3 consumer members (concurrency=3)\", () => pm.expect(g.memberCount).to.eql(3));",
+                  "pm.test(\"cooperative-sticky assignor\", () => pm.expect(g.partitionAssignor).to.eql(\"cooperative-sticky\"));",
+                  "pm.collectionVariables.set(\"baselineProcessed\", String(b.application.consumerStats.processedOrders));",
+                  "pm.collectionVariables.set(\"baselineDead\", String(b.application.consumerStats.deadLetteredOrders));",
+                  "pm.collectionVariables.set(\"expectedProcessed\", \"0\");",
+                  "pm.collectionVariables.set(\"expectedDead\", \"0\");",
+                  "pm.collectionVariables.set(\"partitionHistogram\", \"{}\");"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/kafka/cluster-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "kafka",
+                "cluster-status"
+              ]
+            },
+            "description": "**Purpose:** verify topics/partitions exist, the consumer group formed, and store baseline counters.\n\n**Steps:** send the request.\n\n**Expected**\n- `cluster.brokers` has 1 broker (KRaft node id 1), `cluster.clusterId` = `MkU3OEVBNTcwNTJENDM2Qk`.\n- Topics: `orders` = 6 partitions, `orders-audit` = 3, `orders-dlq` = 3; each partition has leader 1 and isr [1].\n- Group `order-processing-group`: state `Stable`, 3 members (concurrency=3), assignor `cooperative-sticky`.\n\n**Side effect:** saves `baselineProcessed`, `baselineDead` and zeroes `expectedProcessed`, `expectedDead`.\n\n**If it returns 503:** Kafka is not reachable or topics were not created yet - wait 10 s and retry."
+          }
+        }
+      ]
+    },
+    {
+      "name": "01 - Producer & Custom Partitioner",
+      "description": "**Feature under test:** idempotent producer (`acks=all`, idempotence, retries=MAX, in-flight=5) and\n`OrderKeyPartitioner` (VIP -> partition 0, standard -> MurmurHash2 over partitions 1-5).\n\n**Key facts**\n- Record key = `customerId`, so one customer always maps to one partition (per-key ordering).\n- VIP = `customerId` in `VIP-001,VIP-002,VIP-003` OR `customerTier = VIP`.\n- Each successful publish is eventually consumed; tests add to `expectedProcessed`.\n\n**Visual check (Kafka UI):** Topics -> `orders` -> Messages. Filter by partition 0: only VIP orders appear.\nPartitions 1-5 hold standard orders.\n\n**CLI check:**\n`docker exec -it kafka-kraft /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic orders --from-beginning --property print.partition=true --property print.key=true`",
+      "item": [
+        {
+          "name": "1.1 Publish VIP order (by configured customer ID)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        const b = pm.response.json();",
+                  "        pm.test(\"PUBLISHED\", () => pm.expect(b.status).to.eql(\"PUBLISHED\"));",
+                  "        pm.test(\"topic is orders\", () => pm.expect(b.receipt.topic).to.eql(\"orders\"));",
+                  "        pm.test(\"key equals customerId\", () => pm.expect(b.receipt.key).to.eql(\"VIP-001\"));",
+                  "        pm.test(\"routed to VIP partition\", () => pm.expect(b.receipt.partition).to.eql(parseInt(pm.collectionVariables.get(\"vipPartition\"))));",
+                  "        pm.test(\"VIP flag true\", () => pm.expect(b.routedToDedicatedVipPartition).to.be.true);",
+                  "        pm.test(\"orderId auto-generated\", () => pm.expect(b.orderId).to.be.a(\"string\").and.not.empty);",
+                  "        if (pm.response.code === 200) inc(\"expectedProcessed\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** VIP customer ID is routed to the dedicated partition.\n\n**Steps:** send the request (customer `VIP-001`).\n\n**Expected:** 200, `receipt.partition` = 0, `routedToDedicatedVipPartition` = true, `receipt.topic` = `orders`.\n\n**Also check:** app log shows `[CONSUME] orders-0@<offset> key=VIP-001`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"VIP-001\",\n  \"product\": \"laptop\",\n  \"quantity\": 1,\n  \"amount\": 1999.99\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "1.2 Publish VIP order (by tier, unknown customer ID)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        const b = pm.response.json();",
+                  "        pm.test(\"routed to VIP partition by tier\", () => pm.expect(b.receipt.partition).to.eql(0));",
+                  "        pm.test(\"tier echoed as VIP\", () => pm.expect(b.customerTier).to.eql(\"VIP\"));",
+                  "        if (pm.response.code === 200) inc(\"expectedProcessed\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** the partitioner also inspects the event value - `customerTier=VIP` routes to partition 0\neven when the ID is not in the VIP list.\n\n**Expected:** 200, `receipt.partition` = 0.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-7\",\n  \"product\": \"monitor\",\n  \"quantity\": 1,\n  \"amount\": 350,\n  \"customerTier\": \"VIP\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "1.3 Publish STANDARD order (cust-42)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        const b = pm.response.json();",
+                  "        pm.test(\"partition is 1..5 (never the VIP lane)\", () => pm.expect(b.receipt.partition).to.be.within(1, 5));",
+                  "        pm.test(\"VIP flag false\", () => pm.expect(b.routedToDedicatedVipPartition).to.be.false);",
+                  "        pm.test(\"default tier STANDARD\", () => pm.expect(b.customerTier).to.eql(\"STANDARD\"));",
+                  "        pm.collectionVariables.set(\"custA_partition\", String(b.receipt.partition));",
+                  "        if (pm.response.code === 200) inc(\"expectedProcessed\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** standard customers must NEVER land on partition 0.\n\n**Expected:** 200, `receipt.partition` between 1 and 5, `routedToDedicatedVipPartition` = false.\nThe partition is saved in `custA_partition` for the next request.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-42\",\n  \"product\": \"mouse\",\n  \"quantity\": 2,\n  \"amount\": 49.9\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "1.4 Publish STANDARD order again (same key -> same partition)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        const b = pm.response.json();",
+                  "        pm.test(\"same partition as previous cust-42 order\", () => pm.expect(String(b.receipt.partition)).to.eql(pm.collectionVariables.get(\"custA_partition\")));",
+                  "        if (pm.response.code === 200) inc(\"expectedProcessed\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** key affinity - MurmurHash2(key) is deterministic, so ordering per customer is preserved.\n\n**Expected:** partition equals the one recorded in request 1.3, and the offset is higher.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-42\",\n  \"product\": \"keyboard\",\n  \"quantity\": 1,\n  \"amount\": 89\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "1.5 Validation error - missing customerId",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** bean validation rejects bad input before anything reaches Kafka.\n\n**Expected:** HTTP 400, nothing published.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product\": \"x\",\n  \"quantity\": 1,\n  \"amount\": 5\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "1.6 Validation error - quantity 0",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** `@Min(1)` on quantity. **Expected:** HTTP 400.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-1\",\n  \"product\": \"x\",\n  \"quantity\": 0,\n  \"amount\": 5\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "1.7 Partition distribution (RUN 30x in Collection Runner)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        const p = pm.response.json().receipt.partition;",
+                  "        pm.test(\"standard order avoids partition 0\", () => pm.expect(p).to.be.within(1, 5));",
+                  "        const h = JSON.parse(pm.collectionVariables.get(\"partitionHistogram\") || \"{}\");",
+                  "        h[p] = (h[p] || 0) + 1;",
+                  "        pm.collectionVariables.set(\"partitionHistogram\", JSON.stringify(h));",
+                  "        console.log(\"partition histogram:\", JSON.stringify(h));",
+                  "        if (pm.response.code === 200) inc(\"expectedProcessed\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** show MurmurHash2 spreading many standard keys across partitions 1-5 and none on 0.\n\n**Steps**\n1. Right-click this request -> *Run* (or Runner with only this request), **Iterations = 30**, delay 0.\n2. Open the Postman Console (View -> Show Postman Console): the histogram is logged every iteration.\n\n**Expected:** every iteration passes (partition 1-5); final histogram has 5 keys (1..5), none for 0.\nIn Kafka UI, partitions 1-5 of `orders` fill roughly evenly.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-{{$randomInt}}-{{$randomAlphaNumeric}}\",\n  \"product\": \"widget\",\n  \"quantity\": 1,\n  \"amount\": 12.5\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 - Transactional Producer (Exactly-Once writes)",
+      "description": "**Feature under test:** `@Transactional` + `KafkaTransactionManager` writing to `orders` and `orders-audit`\natomically.\n\n**Consumers use `isolation.level=read_committed`**, so aborted records are never delivered.\n\n**CLI check for visibility (run after 2.2):**\n`docker exec -it kafka-kraft /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic orders-audit --from-beginning --isolation-level read_committed --property print.key=true`\n-> shows audit records of 2.1 but NOT of 2.2. With `--isolation-level read_uncommitted` the aborted ones appear too.",
+      "item": [
+        {
+          "name": "2.1 Commit - 2 orders -> 4 records in 2 topics",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        const b = pm.response.json();",
+                  "        pm.test(\"COMMITTED\", () => pm.expect(b.status).to.eql(\"COMMITTED\"));",
+                  "        pm.test(\"4 records\", () => pm.expect(b.recordCount).to.eql(4));",
+                  "        pm.test(\"2 in orders, 2 in orders-audit\", () => {",
+                  "          pm.expect(b.receipts.filter(r => r.topic === \"orders\").length).to.eql(2);",
+                  "          pm.expect(b.receipts.filter(r => r.topic === \"orders-audit\").length).to.eql(2);",
+                  "        });",
+                  "        pm.test(\"VIP-002 order went to partition 0\", () => {",
+                  "          const r = b.receipts.find(r => r.topic === \"orders\" && r.key === \"VIP-002\");",
+                  "          pm.expect(r.partition).to.eql(0);",
+                  "        });",
+                  "        pm.test(\"standard order avoided partition 0\", () => {",
+                  "          const r = b.receipts.find(r => r.topic === \"orders\" && r.key === \"cust-tx-1\");",
+                  "          pm.expect(r.partition).to.be.within(1, 5);",
+                  "        });",
+                  "        if (pm.response.code === 200) inc(\"expectedProcessed\", 2);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/transactional",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "transactional"
+              ]
+            },
+            "description": "**Purpose:** one transaction, two topics, several partitions.\n\n**Steps:** send. The batch contains a standard order (`cust-tx-1`) and a VIP order (`VIP-002`).\n\n**Expected:** 200, `status` = COMMITTED, `recordCount` = 4 (2 x `orders` + 2 x `orders-audit`).\nThe `VIP-002` record in `orders` is on partition 0. App log: `Transaction of 4 records will COMMIT`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"simulateFailure\": false,\n  \"orders\": [\n    {\n      \"customerId\": \"cust-tx-1\",\n      \"product\": \"tx-product-A\",\n      \"quantity\": 1,\n      \"amount\": 10\n    },\n    {\n      \"customerId\": \"VIP-002\",\n      \"product\": \"tx-product-B\",\n      \"quantity\": 1,\n      \"amount\": 20\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "2.2 Abort - simulateFailure=true",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 Conflict\", () => pm.response.to.have.status(409));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"ABORTED\", () => pm.expect(b.status).to.eql(\"ABORTED\"));",
+                  "pm.test(\"reason mentions simulated failure\", () => pm.expect(b.reason).to.include(\"Simulated failure\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/transactional",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "transactional"
+              ]
+            },
+            "description": "**Purpose:** records are written to the broker, then the transaction is aborted.\n\n**Steps:** send (product `SHOULD_NEVER_BE_CONSUMED`).\n\n**Expected:** HTTP 409, `status` = ABORTED, reason mentions the simulated failure. App log:\n`Simulating failure ... transaction will ABORT`.\n\n**Proof of atomicity:** the listener never logs `[CONSUME]` for this product, and request 3.5\n(exact counter equality) would fail if an aborted record had been processed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"simulateFailure\": true,\n  \"orders\": [\n    {\n      \"customerId\": \"cust-tx-abort\",\n      \"product\": \"SHOULD_NEVER_BE_CONSUMED\",\n      \"quantity\": 1,\n      \"amount\": 99\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "2.3 Validation error - empty batch",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/transactional",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "transactional"
+              ]
+            },
+            "description": "**Expected:** HTTP 400 (`@NotEmpty orders`).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"simulateFailure\": false,\n  \"orders\": []\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 - Consumer, Retry & Dead Letter Queue",
+      "description": "**Feature under test:** manual ack (`MANUAL_IMMEDIATE`), `DefaultErrorHandler` with exponential backoff\n(3 retries: 1 s, 2 s, 4 s) and routing to `orders-dlq`.\n\n| product | behaviour | counter effect |\n|---|---|---|\n| `FAIL_ONCE` | fails first delivery, retry succeeds | processed +1 |\n| `FAIL_ALWAYS` | 4 attempts (t=0,1,3,7 s) then DLQ | dead +1 |\n| `POISON_PILL` | non-retryable, DLQ at once | dead +1 |\n| `amount <= 0` | non-retryable, DLQ at once | dead +1 |\n\n**Watch the app log** while running: `[RETRY] attempt N failed`, `[DLQ] Routing record ...`,\n`[RECOVERED] ...`, `[DLQ-MONITOR] ... exception=... message=...`.\nIn Kafka UI open topic `orders-dlq` -> Messages -> Headers: `kafka_dlt-original-topic`, `-partition`,\n`-offset`, `kafka_dlt-exception-message`.",
+      "item": [
+        {
+          "name": "3.1 FAIL_ONCE (transient failure, succeeds on retry)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        if (pm.response.code === 200) inc(\"expectedProcessed\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Steps:** send, then watch the log: attempt 1 fails (\"Transient failure\"), ~1 s later the retry succeeds.\n\n**Expected:** publish returns 200 immediately (async consumer). No DLQ record.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-retry-1\",\n  \"product\": \"FAIL_ONCE\",\n  \"quantity\": 1,\n  \"amount\": 25\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "3.2 FAIL_ALWAYS (retries exhausted -> DLQ)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        if (pm.response.code === 200) inc(\"expectedDead\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Steps:** send, watch the log for ~7 s: 4 failed attempts with growing delays, then\n`[DLQ] Routing record orders-<p>@<o> to 'orders-dlq'`.\n\n**Expected:** publish 200; one record appears in `orders-dlq` within ~10 s.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-retry-2\",\n  \"product\": \"FAIL_ALWAYS\",\n  \"quantity\": 1,\n  \"amount\": 25\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "3.3 POISON_PILL (non-retryable -> immediate DLQ)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        if (pm.response.code === 200) inc(\"expectedDead\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Steps:** send; the log shows NO retry attempts - the record is dead-lettered on the first failure.\n\n**Expected:** 200; DLQ record with `kafka_dlt-exception-fqcn` ending in `NonRetryableOrderException`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-poison\",\n  \"product\": \"POISON_PILL\",\n  \"quantity\": 1,\n  \"amount\": 25\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "3.4 Invalid amount (-5) -> DLQ",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const inc = (k, n) => pm.collectionVariables.set(k, String(parseInt(pm.collectionVariables.get(k) || '0', 10) + n));",
+                  "        pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "        if (pm.response.code === 200) inc(\"expectedDead\", 1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/publish",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "publish"
+              ]
+            },
+            "description": "**Purpose:** the API accepts any non-null amount; the consumer's business rule rejects `amount <= 0`\nas non-retryable.\n\n**Expected:** 200 from the API; DLQ record shortly after.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"cust-badamount\",\n  \"product\": \"gadget\",\n  \"quantity\": 1,\n  \"amount\": -5\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "3.5 VERIFY counters (waits, then exact-match assertions)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const ms = parseInt(pm.collectionVariables.get(\"settleDelayMs\") || \"15000\", 10);",
+                  "console.log(\"Waiting \" + ms + \" ms for retries/DLQ to settle...\");",
+                  "setTimeout(function () {}, ms);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const s = pm.response.json().application.consumerStats;",
+                  "const dp = s.processedOrders - parseInt(pm.collectionVariables.get(\"baselineProcessed\"));",
+                  "const dd = s.deadLetteredOrders - parseInt(pm.collectionVariables.get(\"baselineDead\"));",
+                  "const ep = parseInt(pm.collectionVariables.get(\"expectedProcessed\"));",
+                  "const ed = parseInt(pm.collectionVariables.get(\"expectedDead\"));",
+                  "pm.test(`processed delta ${dp} == expected ${ep}`, () => pm.expect(dp).to.eql(ep));",
+                  "pm.test(`dead-lettered delta ${dd} == expected ${ed}`, () => pm.expect(dd).to.eql(ed));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/kafka/cluster-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "kafka",
+                "cluster-status"
+              ]
+            },
+            "description": "**Purpose:** prove every published order was either processed or dead-lettered - and that the\naborted transaction (2.2) was never processed.\n\n**Steps:** run after folders 01-03. The pre-request script waits `settleDelayMs` (default 15 s) so\nFAIL_ALWAYS (7 s of backoff) completes. If the wait is unsupported in your Postman version,\nwait ~15 s manually.\n\n**Expected:** `processedOrders - baselineProcessed` = `expectedProcessed` and\n`deadLetteredOrders - baselineDead` = `expectedDead`. Any other traffic or a restart of the app\nduring the run invalidates exact equality - re-run from request 0.2."
+          }
+        },
+        {
+          "name": "3.6 Cluster status after processing (group health & lag)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const g = pm.response.json().consumerGroups;",
+                  "const og = g[\"order-processing-group\"];",
+                  "pm.test(\"order group Stable\", () => pm.expect(og.state).to.eql(\"Stable\"));",
+                  "pm.test(\"3 members\", () => pm.expect(og.memberCount).to.eql(3));",
+                  "pm.test(\"each member has 2 partitions\", () => og.members.forEach(m => pm.expect(m.assignedPartitions.length).to.eql(2)));",
+                  "pm.test(\"lag is small (markers only)\", () => pm.expect(og.totalLag).to.be.below(10));",
+                  "pm.test(\"DLQ monitor has 1 member\", () => pm.expect(g[\"orders-dlq-monitor-group\"].memberCount).to.eql(1));",
+                  "pm.test(\"DLQ topic received dead letters\", () => {",
+                  "  const end = pm.response.json().topics[\"orders-dlq\"].partitions.reduce((a, p) => a + p.endOffset, 0);",
+                  "  pm.expect(end).to.be.at.least(parseInt(pm.collectionVariables.get(\"expectedDead\")));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/kafka/cluster-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "kafka",
+                "cluster-status"
+              ]
+            },
+            "description": "**Purpose:** inspect committed offsets (manual acks) and lag.\n\n**Expected:** `order-processing-group` Stable with 3 members, 6 partitions assigned in total\n(2 per member); `orders-dlq-monitor-group` has 1 member.\n\n**About lag:** transaction commit/abort markers occupy offsets but are not records, so a small\nresidual lag (a few offsets) can remain on partitions whose last entry is a marker. That is normal."
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 - Consumer Group Rebalance (manual + observation)",
+      "description": "**Feature under test:** `CustomRebalanceListener` and cooperative-sticky rebalancing.\n\n**Steps**\n1. Run 4.1 (single instance: 3 members, 2 partitions each).\n2. In a second terminal start instance 2:\n   `mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8082`\n3. Watch BOTH consoles: instance 1 logs `[REBALANCE] ... REVOKING ...` for some partitions, instance 2 logs\n   `[REBALANCE] ... ASSIGNED ...`. With the cooperative assignor only the moved partitions are revoked.\n4. Wait ~10 s, then run 4.2 and 4.3.\n5. Stop instance 2 (Ctrl+C) and re-run 4.1: members return to 3 and instance 1 logs ASSIGNED for the\n   partitions it gets back.",
+      "item": [
+        {
+          "name": "4.1 Cluster status - instance 1 (single instance)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const g = pm.response.json().consumerGroups[\"order-processing-group\"];",
+                  "pm.test(\"3 members while a single instance runs\", () => pm.expect(g.memberCount).to.eql(3));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/kafka/cluster-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "kafka",
+                "cluster-status"
+              ]
+            },
+            "description": "**Expected (only instance 1 running):** 3 members, each with 2 partitions."
+          }
+        },
+        {
+          "name": "4.2 Cluster status after starting instance 2",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const g = pm.response.json().consumerGroups[\"order-processing-group\"];",
+                  "pm.test(\"6 members after scale-out\", () => pm.expect(g.memberCount).to.eql(6));",
+                  "pm.test(\"1 partition per member\", () => g.members.forEach(m => pm.expect(m.assignedPartitions.length).to.eql(1)));",
+                  "pm.test(\"Stable\", () => pm.expect(g.state).to.eql(\"Stable\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/kafka/cluster-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "kafka",
+                "cluster-status"
+              ]
+            },
+            "description": "**Expected:** 6 members (3 threads x 2 instances), each owning exactly 1 of the 6 `orders` partitions.\nUses the instance-1 URL; the group view is cluster-wide."
+          }
+        },
+        {
+          "name": "4.3 Rebalance listener snapshot - instance 1",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json().application.rebalanceListener;",
+                  "console.log(JSON.stringify(r, null, 2));",
+                  "pm.test(\"initial assignments recorded\", () => pm.expect(r.assignedEvents).to.be.at.least(3));",
+                  "pm.test(\"partitions were revoked during scale-out\", () => pm.expect(r.revokedEvents).to.be.at.least(1));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/kafka/cluster-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "kafka",
+                "cluster-status"
+              ]
+            },
+            "description": "**Purpose:** `application.rebalanceListener` exposes counts and the partitions each listener thread owns.\n\n**Expected:** `revokedEvents >= 1` (instance 1 gave partitions to instance 2), `assignedEvents >= 3`\n(initial assignment), and each thread's list is shorter than before."
+          }
+        },
+        {
+          "name": "4.4 Cluster status - instance 2 (port 8082)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"instance 2 was assigned partitions\", () => pm.expect(pm.response.json().application.rebalanceListener.assignedEvents).to.be.at.least(1));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl2}}/api/v1/kafka/cluster-status",
+              "host": [
+                "{{baseUrl2}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "kafka",
+                "cluster-status"
+              ]
+            },
+            "description": "**Purpose:** instance 2 reports the same group and its own listener-thread assignments.\n\n**Expected:** 200 and `rebalanceListener.assignedEvents >= 1`."
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 - Log Engine Simulator (segments, index, LEO vs HW)",
+      "description": "**Feature under test:** `KafkaStorageEngineSimulator` - `.log` / `.index` / `.timeindex` files, sparse index\nlookups, segment rolling, LEO, High Watermark, ISR.\n\n**Config in effect:** `segment-bytes=1024`, `index-interval-bytes=256`, `max-follower-lag=5`, followers\n`follower-1`, `follower-2`.\n\n**IMPORTANT:** the consumer mirrors every processed order into this same simulated log\n(`app.log-engine.mirror-consumed-orders=true`). Run this folder in order, starting with 5.1 (reset),\nand do NOT publish orders meanwhile - otherwise the exact LEO/HW numbers differ. (Or start the app with\n`--app.log-engine.mirror-consumed-orders=false`.)\n\n**Disk check:** open `<java.io.tmpdir>/kafka-log-engine/orders-0/` (e.g. `/tmp/kafka-log-engine/orders-0`)\nand run `ls -l` / `xxd 00000000000000000000.index | head` while following along.\n\n**Model recap:** LEO = next offset the leader assigns. HW = min(LEO of in-sync replicas). Consumers read\nonly offsets < HW. A follower more than 5 records behind leaves the ISR and stops holding back the HW.",
+      "item": [
+        {
+          "name": "5.1 Reset simulated log",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"RESET\", () => pm.expect(pm.response.json().status).to.eql(\"RESET\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/reset",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "reset"
+              ]
+            },
+            "description": "**Expected:** `{\"status\":\"RESET\"}`. Old segment files are deleted; new segment `000...0.log` is created."
+          }
+        },
+        {
+          "name": "5.2 Inspect empty log",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"LEO 0 / HW 0\", () => { pm.expect(b.logEndOffset).to.eql(0); pm.expect(b.highWatermark).to.eql(0); });",
+                  "pm.test(\"single active segment at base 0\", () => {",
+                  "  pm.expect(b.segments.length).to.eql(1);",
+                  "  pm.expect(b.activeSegment.baseOffset).to.eql(0);",
+                  "  pm.expect(b.activeSegment.active).to.be.true;",
+                  "  pm.expect(b.activeSegment.logFile).to.eql(\"00000000000000000000.log\");",
+                  "  pm.expect(b.activeSegment.recordCount).to.eql(0);",
+                  "});",
+                  "pm.test(\"3 replicas, all in sync\", () => { pm.expect(b.replicas.length).to.eql(3); pm.expect(b.inSyncReplicas.length).to.eql(3); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/inspect",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "inspect"
+              ]
+            },
+            "description": "**Expected:** LEO = 0, HW = 0, exactly one (active) segment with base offset 0, no records, no index\nentries; 3 replicas (leader, follower-1, follower-2) all in sync."
+          }
+        },
+        {
+          "name": "5.3 Append one record (replicated)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"offset 0 at position 0\", () => { pm.expect(b.offset).to.eql(0); pm.expect(b.position).to.eql(0); });",
+                  "pm.test(\"LEO 1 and HW 1\", () => { pm.expect(b.logEndOffset).to.eql(1); pm.expect(b.highWatermark).to.eql(1); });",
+                  "pm.test(\"record size > 12-byte header\", () => pm.expect(b.sizeBytes).to.be.above(12));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/append",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "append"
+              ]
+            },
+            "description": "**Expected:** offset 0 at byte position 0; `segmentRolled` false; LEO 1; HW 1 (followers fetched it).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key\": \"customer-A\",\n  \"value\": \"{\\\"orderId\\\":\\\"MANUAL-1\\\",\\\"amount\\\":10}\",\n  \"replicate\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "5.4 Reset again (clean slate for the numbers below)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"RESET\", () => pm.expect(pm.response.json().status).to.eql(\"RESET\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/reset",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "reset"
+              ]
+            },
+            "description": "**Purpose:** 5.3 left one record in the log. Reset so the following steps use round numbers\n(offsets 0..29 after the next request).\n\n**Expected:** `{\"status\":\"RESET\"}`."
+          }
+        },
+        {
+          "name": "5.5 Seed 30 records (forces segment rolls)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"30 appended\", () => pm.expect(b.recordsAppended).to.eql(30));",
+                  "pm.test(\"segments rolled at least once\", () => pm.expect(b.segmentsRolledDuringSeed).to.be.at.least(1));",
+                  "pm.test(\"last offset 29, LEO 30, HW 30\", () => {",
+                  "  pm.expect(b.lastAppend.offset).to.eql(29);",
+                  "  pm.expect(b.lastAppend.logEndOffset).to.eql(30);",
+                  "  pm.expect(b.lastAppend.highWatermark).to.eql(30);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/seed?count=30&replicate=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "seed"
+              ],
+              "query": [
+                {
+                  "key": "count",
+                  "value": "30"
+                },
+                {
+                  "key": "replicate",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "**Purpose:** generate enough data to roll segments (`segment-bytes=1024`, ~100 bytes per record).\n\n**Expected:** 30 records appended; at least 2 segment rolls; last offset 29, LEO 30, HW 30\n(both followers fetch every record because `replicate=true`)."
+          }
+        },
+        {
+          "name": "5.6 Inspect: segments, index, byte positions",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"LEO 30 / HW 30\", () => { pm.expect(b.logEndOffset).to.eql(30); pm.expect(b.highWatermark).to.eql(30); });",
+                  "pm.test(\"at least 2 segments\", () => pm.expect(b.segments.length).to.be.at.least(2));",
+                  "pm.test(\"record counts sum to 30\", () => pm.expect(b.segments.reduce((a, s) => a + s.recordCount, 0)).to.eql(30));",
+                  "pm.test(\"segment base offsets are contiguous\", () => {",
+                  "  for (let i = 1; i < b.segments.length; i++) pm.expect(b.segments[i].baseOffset).to.eql(b.segments[i-1].baseOffset + b.segments[i-1].recordCount);",
+                  "});",
+                  "pm.test(\"first segment files are named by base offset\", () => {",
+                  "  const s = b.segments[0];",
+                  "  pm.expect(s.logFile).to.eql(\"00000000000000000000.log\");",
+                  "  pm.expect(s.indexFile).to.eql(\"00000000000000000000.index\");",
+                  "  pm.expect(s.timeIndexFile).to.eql(\"00000000000000000000.timeindex\");",
+                  "});",
+                  "pm.test(\"first segment has sparse index entries (8 bytes each)\", () => {",
+                  "  const s = b.segments[0];",
+                  "  pm.expect(s.indexEntries.length).to.be.above(0);",
+                  "  pm.expect(s.indexSizeBytes).to.eql(s.indexEntries.length * 8);",
+                  "});",
+                  "pm.test(\"records are contiguous on disk and CRC-valid\", () => {",
+                  "  const r = b.segments[0].records;",
+                  "  pm.expect(r[0].position).to.eql(0);",
+                  "  for (let i = 1; i < r.length; i++) pm.expect(r[i].position).to.eql(r[i-1].position + r[i-1].sizeBytes);",
+                  "  r.forEach(x => pm.expect(x.crcValid).to.be.true);",
+                  "});",
+                  "pm.test(\"only the last segment is active\", () => b.segments.forEach((s, i) => pm.expect(s.active).to.eql(i === b.segments.length - 1)));",
+                  "pm.test(\"a sealed segment stays below segment.bytes\", () => pm.expect(b.segments[0].logSizeBytes).to.be.at.most(b.config.segmentBytes));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/inspect",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "inspect"
+              ]
+            },
+            "description": "**What to read in the response**\n- `segments[]` - one entry per `.log/.index/.timeindex` triple; names are the zero-padded base offset.\n- `segments[i].indexEntries` - sparse index: `relativeOffset -> filePosition`, roughly every 256 bytes.\n- `segments[i].records` - each record's `offset`, `position` (byte), `sizeBytes`, `crcValid`.\n- `activeSegment` - the segment still being written (last one).\n\n**Expected:** segments are contiguous (next base offset = previous base + record count), records are\nlaid out back-to-back (`position[n+1] = position[n] + sizeBytes[n]`), CRCs valid, record counts sum to 30.\n\nNote: `timeIndexEntries` may be empty for rapid appends (an entry needs a strictly newer timestamp)."
+          }
+        },
+        {
+          "name": "5.7 Offset lookup trace (offset 17)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const t = pm.response.json().lookupTrace;",
+                  "console.log(t.explanation);",
+                  "pm.test(\"offset 17 found\", () => { pm.expect(t.found).to.be.true; pm.expect(t.targetOffset).to.eql(17); });",
+                  "pm.test(\"record position resolved\", () => pm.expect(t.recordPosition).to.be.a(\"number\"));",
+                  "pm.test(\"scan started at or before the record\", () => pm.expect(t.scanStartPosition).to.be.at.most(t.recordPosition));",
+                  "pm.test(\"partial scan only (index helped)\", () => pm.expect(t.recordsScanned).to.be.below(12));",
+                  "pm.test(\"explanation present\", () => pm.expect(t.explanation).to.be.a(\"string\").and.not.empty);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/inspect?lookupOffset=17",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "inspect"
+              ],
+              "query": [
+                {
+                  "key": "lookupOffset",
+                  "value": "17"
+                }
+              ]
+            },
+            "description": "**Purpose:** show how Kafka finds an offset: pick the segment by base offset -> binary search the sparse\nindex -> scan the `.log` forward from that byte position.\n\n**Steps:** read `lookupTrace.explanation` - it lists the segment, index entry used, binary-search\nsteps, and how many records/bytes were scanned.\n\n**Expected:** `found` true; the scan touches only a few records, not the whole segment."
+          }
+        },
+        {
+          "name": "5.8 Lookup out of range (offset 9999)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const t = pm.response.json().lookupTrace;",
+                  "pm.test(\"not found\", () => pm.expect(t.found).to.be.false);",
+                  "pm.test(\"explanation says out of range\", () => pm.expect(t.explanation).to.include(\"out of range\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/inspect?lookupOffset=9999",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "inspect"
+              ],
+              "query": [
+                {
+                  "key": "lookupOffset",
+                  "value": "9999"
+                }
+              ]
+            },
+            "description": "**Expected:** `lookupTrace.found` false with an out-of-range explanation (valid range [0, LEO))."
+          }
+        },
+        {
+          "name": "5.9 Consumer-style read (offsets 5..7)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"3 records offsets 5,6,7\", () => pm.expect(b.records.map(r => r.offset)).to.eql([5, 6, 7]));",
+                  "pm.test(\"CRC valid, below HW\", () => b.records.forEach(r => { pm.expect(r.crcValid).to.be.true; pm.expect(r.aboveHighWatermark).to.be.false; }));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/read?offset=5&max=3",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "read"
+              ],
+              "query": [
+                {
+                  "key": "offset",
+                  "value": "5"
+                },
+                {
+                  "key": "max",
+                  "value": "3"
+                }
+              ]
+            },
+            "description": "**Expected:** exactly 3 records with offsets 5, 6, 7, valid CRCs, and a `lookupTrace`."
+          }
+        },
+        {
+          "name": "5.10 Pause follower-2",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"follower-2 paused\", () => pm.expect(b.pausedFollowers).to.include(\"follower-2\"));",
+                  "pm.test(\"still in ISR (no lag yet)\", () => pm.expect(b.inSyncReplicas).to.include(\"follower-2\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/followers/follower-2/pause",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "followers",
+                "follower-2",
+                "pause"
+              ]
+            },
+            "description": "**Purpose:** simulate a slow/stalled follower. It is still in the ISR until it lags by more than 5.\n\n**Expected:** `pausedFollowers` contains follower-2; ISR still has all 3 replicas."
+          }
+        },
+        {
+          "name": "5.11 Seed 3 while follower-2 is paused -> HW stays at 30",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const a = pm.response.json().lastAppend;",
+                  "pm.test(\"LEO 33\", () => pm.expect(a.logEndOffset).to.eql(33));",
+                  "pm.test(\"HW stuck at 30\", () => pm.expect(a.highWatermark).to.eql(30));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/seed?count=3&replicate=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "seed"
+              ],
+              "query": [
+                {
+                  "key": "count",
+                  "value": "3"
+                },
+                {
+                  "key": "replicate",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "**Purpose:** show LEO racing ahead of HW.\n\n**Expected:** LEO 33, HW 30 - follower-2 is 3 behind (<= 5, still ISR) and holds the HW back."
+          }
+        },
+        {
+          "name": "5.12 Read offset 30 -> hidden (above HW)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"no records visible\", () => pm.expect(b.records.length).to.eql(0));",
+                  "pm.test(\"note mentions high watermark\", () => pm.expect(b.note.toLowerCase()).to.include(\"high watermark\"));",
+                  "pm.test(\"offset itself exists on the leader\", () => pm.expect(b.lookupTrace.found).to.be.true);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/read?offset=30&max=5",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "read"
+              ],
+              "query": [
+                {
+                  "key": "offset",
+                  "value": "30"
+                },
+                {
+                  "key": "max",
+                  "value": "5"
+                }
+              ]
+            },
+            "description": "**Purpose:** offsets 30-32 exist on the leader but are NOT committed, so consumers cannot see them.\n\n**Expected:** empty `records`; `note` explains the offset is at/above the high watermark."
+          }
+        },
+        {
+          "name": "5.13 Replicate a paused follower -> 409",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 Conflict\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"error mentions paused\", () => pm.expect(pm.response.json().error).to.include(\"paused\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/replicate?follower=follower-2&count=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "replicate"
+              ],
+              "query": [
+                {
+                  "key": "follower",
+                  "value": "follower-2"
+                },
+                {
+                  "key": "count",
+                  "value": "1"
+                }
+              ]
+            },
+            "description": "**Expected:** HTTP 409 with an error saying follower-2 is paused."
+          }
+        },
+        {
+          "name": "5.14 Replicate unknown follower -> 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"error mentions unknown follower\", () => pm.expect(pm.response.json().error).to.include(\"Unknown follower\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/replicate?follower=follower-9&count=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "replicate"
+              ],
+              "query": [
+                {
+                  "key": "follower",
+                  "value": "follower-9"
+                },
+                {
+                  "key": "count",
+                  "value": "1"
+                }
+              ]
+            },
+            "description": "**Expected:** HTTP 400, `Unknown follower 'follower-9'`."
+          }
+        },
+        {
+          "name": "5.15 Seed 5 more -> follower-2 leaves ISR, HW jumps to 38",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const a = pm.response.json().lastAppend;",
+                  "pm.test(\"LEO 38\", () => pm.expect(a.logEndOffset).to.eql(38));",
+                  "pm.test(\"HW advanced to 38 after ISR shrink\", () => pm.expect(a.highWatermark).to.eql(38));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/seed?count=5&replicate=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "seed"
+              ],
+              "query": [
+                {
+                  "key": "count",
+                  "value": "5"
+                },
+                {
+                  "key": "replicate",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "**Purpose:** ISR shrink. Once follower-2 is more than 5 records behind (lag 8 at the end) it is\ndropped from the ISR, so the HW is computed from leader + follower-1 only.\n\n**Expected:** LEO 38 and HW 38."
+          }
+        },
+        {
+          "name": "5.16 Inspect replicas after ISR shrink",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"ISR is leader + follower-1\", () => pm.expect(b.inSyncReplicas).to.eql([\"leader\", \"follower-1\"]));",
+                  "const f2 = b.replicas.find(r => r.replicaId === \"follower-2\");",
+                  "pm.test(\"follower-2 out of sync, paused, lag 8\", () => {",
+                  "  pm.expect(f2.inSync).to.be.false; pm.expect(f2.paused).to.be.true; pm.expect(f2.lagBehindLeader).to.eql(8);",
+                  "});",
+                  "pm.test(\"nothing above HW\", () => pm.expect(b.messagesAboveHighWatermark).to.eql(0));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/inspect",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "inspect"
+              ]
+            },
+            "description": "**Expected:** ISR = [leader, follower-1]; follower-2 `inSync` false, `paused` true, lag 8;\n`messagesAboveHighWatermark` 0."
+          }
+        },
+        {
+          "name": "5.17 Resume follower-2",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"no paused followers\", () => pm.expect(b.pausedFollowers).to.not.include(\"follower-2\"));",
+                  "pm.test(\"still behind / out of ISR\", () => pm.expect(b.inSyncReplicas).to.not.include(\"follower-2\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/followers/follower-2/resume",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "followers",
+                "follower-2",
+                "resume"
+              ]
+            },
+            "description": "**Expected:** `pausedFollowers` no longer lists follower-2 (it is still out of the ISR until it catches up)."
+          }
+        },
+        {
+          "name": "5.18 Follower-2 catches up (fetch 1000)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"follower-2 at leader LEO\", () => pm.expect(b.followerLogEndOffsets[\"follower-2\"]).to.eql(38));",
+                  "pm.test(\"ISR restored to 3 replicas\", () => pm.expect(b.inSyncReplicas.length).to.eql(3));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/replicate?follower=follower-2&count=1000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "replicate"
+              ],
+              "query": [
+                {
+                  "key": "follower",
+                  "value": "follower-2"
+                },
+                {
+                  "key": "count",
+                  "value": "1000"
+                }
+              ]
+            },
+            "description": "**Expected:** follower-2 LEO = 38 (capped at the leader's LEO) and it re-joins the ISR (3 replicas)."
+          }
+        },
+        {
+          "name": "5.19 Append WITHOUT replication (LEO 39, HW 38)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"assigned offset 38\", () => pm.expect(b.offset).to.eql(38));",
+                  "pm.test(\"LEO 39 but HW 38\", () => { pm.expect(b.logEndOffset).to.eql(39); pm.expect(b.highWatermark).to.eql(38); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/append",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "append"
+              ]
+            },
+            "description": "**Purpose:** a record the followers have not fetched yet is not committed.\n\n**Expected:** offset 38, LEO 39, HW still 38.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key\": \"manual-1\",\n  \"value\": \"{\\\"orderId\\\":\\\"MANUAL-2\\\",\\\"amount\\\":77}\",\n  \"replicate\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "5.20 follower-1 fetches -> HW unchanged",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"follower-1 at 39\", () => pm.expect(b.followerLogEndOffsets[\"follower-1\"]).to.eql(39));",
+                  "pm.test(\"HW still 38\", () => pm.expect(b.highWatermark).to.eql(38));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/replicate?follower=follower-1&count=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "replicate"
+              ],
+              "query": [
+                {
+                  "key": "follower",
+                  "value": "follower-1"
+                },
+                {
+                  "key": "count",
+                  "value": "1"
+                }
+              ]
+            },
+            "description": "**Purpose:** the HW is the MIN over the ISR: follower-2 (LEO 38, still in ISR) holds it at 38.\n\n**Expected:** follower-1 LEO 39, HW 38."
+          }
+        },
+        {
+          "name": "5.21 follower-2 fetches -> HW advances to 39",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"HW advanced to 39\", () => pm.expect(pm.response.json().highWatermark).to.eql(39));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/replicate?follower=follower-2&count=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "replicate"
+              ],
+              "query": [
+                {
+                  "key": "follower",
+                  "value": "follower-2"
+                },
+                {
+                  "key": "count",
+                  "value": "1"
+                }
+              ]
+            },
+            "description": "**Expected:** all ISR members have offset 38 -> HW = 39; the record becomes visible to consumers."
+          }
+        },
+        {
+          "name": "5.22 Read offset 38 -> now visible",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json().records;",
+                  "pm.test(\"record 38 visible\", () => { pm.expect(r.length).to.eql(1); pm.expect(r[0].offset).to.eql(38); pm.expect(r[0].key).to.eql(\"manual-1\"); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/read?offset=38&max=5",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "read"
+              ],
+              "query": [
+                {
+                  "key": "offset",
+                  "value": "38"
+                },
+                {
+                  "key": "max",
+                  "value": "5"
+                }
+              ]
+            },
+            "description": "**Expected:** one record: offset 38, key `manual-1`."
+          }
+        },
+        {
+          "name": "5.23 Read at LEO (offset 39) -> out of range",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"empty\", () => pm.expect(b.records.length).to.eql(0));",
+                  "pm.test(\"lookup not found\", () => pm.expect(b.lookupTrace.found).to.be.false);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/read?offset=39&max=5",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "read"
+              ],
+              "query": [
+                {
+                  "key": "offset",
+                  "value": "39"
+                },
+                {
+                  "key": "max",
+                  "value": "5"
+                }
+              ]
+            },
+            "description": "**Expected:** no records; the lookup trace reports out-of-range."
+          }
+        },
+        {
+          "name": "5.24 Force segment roll",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"new segment starts at LEO 39\", () => pm.expect(pm.response.json().newActiveSegmentBaseOffset).to.eql(39));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/roll",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "roll"
+              ]
+            },
+            "description": "**Expected:** `newActiveSegmentBaseOffset` = 39 (the LEO). On disk a new\n`00000000000000000039.log/.index/.timeindex` triple appears."
+          }
+        },
+        {
+          "name": "5.25 Inspect after roll",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"active segment base 39 and empty\", () => {",
+                  "  pm.expect(b.activeSegment.baseOffset).to.eql(39);",
+                  "  pm.expect(b.activeSegment.logFile).to.eql(\"00000000000000000039.log\");",
+                  "  pm.expect(b.activeSegment.recordCount).to.eql(0);",
+                  "});",
+                  "pm.test(\"previous segment sealed\", () => pm.expect(b.segments[b.segments.length - 2].active).to.be.false);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/inspect",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "inspect"
+              ]
+            },
+            "description": "**Expected:** active segment is `00000000000000000039.log`, empty; previous segment sealed."
+          }
+        },
+        {
+          "name": "5.26 Validation error - blank value",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/log-engine/append",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "log-engine",
+                "append"
+              ]
+            },
+            "description": "**Expected:** HTTP 400 (`@NotBlank value`).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key\": \"k\",\n  \"value\": \"\",\n  \"replicate\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
